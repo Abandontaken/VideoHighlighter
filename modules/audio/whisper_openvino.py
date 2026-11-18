@@ -20,6 +20,8 @@ with the app's settings over three 10-minute clips (73.8 -> 13.1 s, 71.9 ->
   looked wrong on the processor was measured too and does not pay: on noisy
   audio it re-decodes most of them, which costs the speed, and the second
   noisy guess is no closer to the first.
+* Nor can it be told to forget the previous window, so a chunk is handed to
+  it in independent pieces of under 30 s (``PIECE_SECONDS``).
 
 The models are the OpenVINO project's own exports on Hugging Face
 (``OpenVINO/whisper-<size>-fp16-ov``, Apache-2.0 / MIT like the Whisper
@@ -148,6 +150,93 @@ def _compile_cache() -> Optional[str]:
         return None
 
 
+# Longest piece the pipeline is handed in one call. Given a whole 10-minute
+# chunk it walks it 30 s at a time, and each window carries the last one's
+# habits forward: measured 2026-11-16 on a 21-minute episode with the 'small'
+# model, once a window came back lowercase without punctuation the next ones
+# did too ("My name's Ash and I'm misty" where two people speak), and a window
+# opening on music came back as six words stretched over 20 s, with the dialogue
+# that followed it lost. openai-whisper has a switch for that carry-over
+# (condition_on_previous_text, off in this app); the pipeline has none, and an
+# initial prompt did not change it. Decoded as independent pieces of at most a
+# window, the first 10 minutes of that episode gave 1400 words instead of 1231,
+# 2 long unpunctuated lines instead of 11, the two speakers as two lines, and no
+# stretched line - for 41 s of decoding instead of 32.
+PIECE_SECONDS = 28.0
+# Each piece ends at the quietest moment of its last few seconds, so a cut
+# falls between words rather than through one.
+CUT_SEARCH_SECONDS = 6.0
+CUT_FRAME_SECONDS = 0.2
+
+
+def quiet_cuts(audio, piece: float = PIECE_SECONDS, search: float = CUT_SEARCH_SECONDS,
+               frame: float = CUT_FRAME_SECONDS) -> List[int]:
+    """Sample positions that split ``audio`` into pieces of at most ``piece``
+    seconds, each ending at the quietest ``frame`` of its last ``search``
+    seconds. Starts at 0 and ends at ``len(audio)``."""
+    import numpy as np
+
+    audio = np.asarray(audio, dtype=np.float32)
+    n = len(audio)
+    span = int(piece * SAMPLE_RATE)
+    width = max(1, int(frame * SAMPLE_RATE))
+    step = max(1, width // 2)
+    cuts = [0]
+    while n - cuts[-1] > span:
+        start = cuts[-1]
+        lo = start + max(width, int((piece - search) * SAMPLE_RATE))
+        hi = start + span
+        best, quietest = hi, None
+        for p in range(lo, hi - width + 1, step):
+            energy = float(np.mean(audio[p:p + width] ** 2))
+            if quietest is None or energy < quietest:
+                best, quietest = p + width // 2, energy
+        cuts.append(best)
+    cuts.append(n)
+    return cuts
+
+
+# A piece whose decode stops this long before the piece does has left speech
+# unread. Within one piece the decoder still carries a habit forward: measured
+# 2026-11-17 on the same episode, a piece opening on the theme song stayed in
+# the song and stopped at its last lyric, 8 s early, with "A Golden Rod
+# Opportunity!" in those 8 s; another stopped after one line and left the
+# rest of the song. Decoded again on its own, each tail came back as what the
+# other transcripts of that episode have there (five tails in 10 minutes, five
+# lines or runs of lyric back). An empty piece is not re-read: there the
+# decoder heard nothing at all, not something and then stopped.
+HOLE_SECONDS = 3.0
+# The tail is decoded from the quietest moment just after the last line, not
+# from the line's end: that end can sit inside the song's last note (64.88 for
+# a song that ended at 65.2), and from there the same tail came back as a line
+# nobody says; from any start in the silence after it, as the right one.
+HOLE_SEARCH_SECONDS = 3.0
+# Less than this left after the start is not worth a call.
+HOLE_MIN_REST_SECONDS = 2.0
+
+
+def hole_start(audio, last: int, end: int, search: float = HOLE_SEARCH_SECONDS,
+               frame: float = CUT_FRAME_SECONDS) -> Optional[int]:
+    """Sample to decode the unread tail ``audio[last:end]`` again from: the
+    middle of its quietest ``frame`` within ``search`` seconds after ``last``.
+    None when the tail is shorter than ``HOLE_SECONDS`` or leaves too little."""
+    import numpy as np
+
+    if (end - last) / SAMPLE_RATE < HOLE_SECONDS:
+        return None
+    width = max(1, int(frame * SAMPLE_RATE))
+    hi = min(last + int(search * SAMPLE_RATE), end - int(HOLE_MIN_REST_SECONDS * SAMPLE_RATE))
+    if hi - width < last:
+        return None
+    audio = np.asarray(audio, dtype=np.float32)
+    best, quietest = last, None
+    for p in range(last, hi - width + 1, max(1, width // 2)):
+        energy = float(np.mean(audio[p:p + width] ** 2))
+        if quietest is None or energy < quietest:
+            best, quietest = p + width // 2, energy
+    return best
+
+
 class Cancelled(RuntimeError):
     """The run was cancelled while a chunk was decoding."""
 
@@ -193,17 +282,21 @@ class OpenVINOWhisper:
         """Decode ``audio`` (a 16 kHz float array, as whisper.load_audio
         returns) into ``{"language": ..., "segments": [...]}``.
 
-        The pipeline decodes a whole chunk in one call and takes no callback
-        for long audio, so it runs on a helper thread while this one keeps the
-        bar moving (by the speed measured on the previous chunk) and watches
-        for a cancel. A cancel returns at once; the call already on the card
-        finishes on its own (seconds) and its result is dropped. Nothing is
-        killed.
+        Audio longer than one Whisper window is decoded as independent pieces
+        cut at quiet moments (``quiet_cuts``), each timed from the start of
+        ``audio``: see ``PIECE_SECONDS`` for why. A piece whose decode stopped
+        well before its end has that tail decoded again (``HOLE_SECONDS``).
+
+        The pipeline decodes a piece in one call and takes no callback, so it
+        runs on a helper thread while this one keeps the bar moving (by the
+        speed measured so far) and watches for a cancel. A cancel returns at
+        once; the call already on the card finishes on its own (seconds) and
+        its result is dropped. Nothing is killed.
         """
         import numpy as np
 
-        samples = np.asarray(audio, dtype=np.float32).tolist()
-        seconds = len(samples) / SAMPLE_RATE
+        audio = np.asarray(audio, dtype=np.float32)
+        seconds = len(audio) / SAMPLE_RATE
         if seconds < MIN_SECONDS:
             # The last chunk of a video can be a sliver (16 samples, seen on a
             # 600.001 s file), and the pipeline refuses anything shorter than
@@ -212,6 +305,48 @@ class OpenVINOWhisper:
                 on_frac(1.0)
             return {"language": language if language and language != "auto" else "unknown",
                     "segments": []}
+
+        cuts = quiet_cuts(audio)
+        segments: List[Dict] = []
+        detected = None
+        shown = [0.0]
+
+        def piece(a, b):
+            if should_cancel and should_cancel():
+                raise Cancelled("Transcription cancelled")
+
+            def piece_frac(f):
+                # Never backwards: a tail decoded again starts inside its piece.
+                shown[0] = max(shown[0], min(0.95, (a + f * (b - a)) / len(audio)))
+                if on_frac:
+                    on_frac(shown[0])
+
+            got = to_result(self._decode(audio[a:b].tolist(), language, piece_frac,
+                                         should_cancel, poll))
+            offset = a / SAMPLE_RATE
+            return got["language"], [dict(seg, start=seg["start"] + offset,
+                                          end=seg["end"] + offset)
+                                     for seg in got["segments"]]
+
+        for a, b in zip(cuts, cuts[1:]):
+            if (b - a) / SAMPLE_RATE < MIN_SECONDS:
+                continue
+            lang, got = piece(a, b)
+            detected = detected or (lang if lang != "unknown" else None)
+            segments.extend(got)
+            if got:
+                last = max(a, int(max(s["end"] for s in got) * SAMPLE_RATE))
+                start = hole_start(audio, last, b)
+                if start is not None:
+                    segments.extend(piece(start, b)[1])
+        if on_frac:
+            on_frac(1.0)
+        return {"language": detected or "unknown", "segments": segments}
+
+    def _decode(self, samples, language, on_frac, should_cancel, poll):
+        """One piece through the pipeline, on a helper thread; see
+        ``transcribe``."""
+        seconds = len(samples) / SAMPLE_RATE
         box: Dict = {}
 
         def work():
@@ -228,24 +363,16 @@ class OpenVINOWhisper:
             worker.join(poll)
             if should_cancel and should_cancel():
                 raise Cancelled("Transcription cancelled")
-            if on_frac:
-                on_frac(min(0.95, (time.time() - t0) / expected))
+            on_frac(min(0.95, (time.time() - t0) / expected))
         if "error" in box:
             raise box["error"]
         took = time.time() - t0
         if took > 0.5:
             self._speed = seconds / took
-        if on_frac:
-            on_frac(1.0)
-        return to_result(box["result"])
+        return box["result"]
 
 
 _TOKEN = re.compile(r"\w+(?:'\w+)*", re.UNICODE)
-
-# A line's times from its words are used only when they stay this close to the
-# line's own: further out, the words were matched to the wrong line.
-WORD_SLACK_SECONDS = 1.0
-
 
 def _tokens(text: str) -> List[str]:
     return [t.lower() for t in _TOKEN.findall(text or "")]
@@ -255,14 +382,22 @@ def times_from_words(segments: List[Dict], words) -> int:
     """Give each segment the start and end of its own words, in place.
     Returns how many segments moved.
 
-    Over a long chunk the pipeline's line times fall on a half-second grid:
-    measured on a 10-minute chunk, almost every line started at x.44 or x.94,
-    0.1-0.5 s before the speech, while its word times matched a decode of the
-    same 30 seconds on their own (295.44 -> 295.66 for a line said at 295.7).
+    The pipeline's line times are not where the lines are said. Over a long
+    chunk they fell on a half-second grid, 0.1-0.5 s early (295.44 for a line
+    said at 295.7); decoded as one piece (``PIECE_SECONDS``) they are worse:
+    the first line starts where the piece does and each next one where the
+    last ended, on whole seconds - measured 2026-11-17, "That sure was a close
+    call" at 307.8 for words said from 315.0, and "This place is humongous" at
+    73.6 for 80.8. The word times were right in both. So the words win however
+    far they are from the line; an earlier limit of 1 s from the line's own
+    times, set while those were only the grid's fraction off, threw exactly
+    these lines' words away.
+
     The words carry the same text as the lines, plus any loop the lines were
-    cleaned of, so they are matched to the lines token by token; a line whose
-    words do not all match, or land outside its own times by more than
-    ``WORD_SLACK_SECONDS``, keeps Whisper's times.
+    cleaned of, so they are matched to the lines token by token. A line keeps
+    Whisper's times when its words do not all match, or when another spoken
+    word falls among them: then the line was matched across speech that is not
+    its own.
     """
     from modules.audio.segment_timing import bounds_from_words
 
@@ -287,14 +422,18 @@ def times_from_words(segments: List[Dict], words) -> int:
         found = owner.get(k, [])
         if not found or len(found) != wanted.get(k):
             continue
-        picked = [words[i] for i in sorted(set(found))]
+        own = sorted(set(found))
+        mine = set(own)
+        if any(_tokens(getattr(words[i], "word", ""))
+               for i in range(own[0], own[-1] + 1) if i not in mine):
+            continue
+        picked = [words[i] for i in own]
         bounds = bounds_from_words([(float(w.start_ts), float(w.end_ts), w.word, 1.0)
                                     for w in picked])
         if bounds is None:
             continue
         start, end = bounds
-        if (end <= start or start < seg["start"] - WORD_SLACK_SECONDS
-                or end > seg["end"] + WORD_SLACK_SECONDS):
+        if end <= start:
             continue
         seg["start"], seg["end"] = start, end
         moved += 1
