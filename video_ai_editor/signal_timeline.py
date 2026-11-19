@@ -1,11 +1,14 @@
 from .timeline_bars import TimelineBar, DraggableTimelineBar, BarLabel
 from collections import defaultdict
 import json
+import numpy as np
 
 from modules.segments import motion_curve
 from modules.system import repaint_trace
+from modules.media.timecode import clock
 from .filmstrip_lane import LANE_HEIGHT as FILMSTRIP_LANE_HEIGHT
 from .filmstrip_lane import FilmstripLane
+from .waveform_lane import WaveformLane, bin_levels
 from .filmstrip_painter import DEFAULT_ASPECT as DEFAULT_FILMSTRIP_ASPECT
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsTextItem,
@@ -295,63 +298,14 @@ class SignalTimelineScene(QGraphicsScene):
         # Draw waveform label
         self.row_labels.append(("AUDIO WAVEFORM", waveform_y))
         
-        # Draw the actual waveform
+        # Draw the actual waveform: one painted item, each bin across its own
+        # time span (video_ai_editor/waveform_lane.py).
         if len(self.waveform) > 0 and self.video_duration > 0:
-            # Calculate proper scaling
             total_width = self.sceneRect().width()
-            points_per_pixel = len(self.waveform) / total_width
-            
-            n_points = len(self.waveform)
-
-            # Color by ENERGY (RMS) where available; falls back to peak for old
-            # 2-tuple caches. Normalize against a high PERCENTILE (not the single
-            # loudest bin) so one loud transient (a bell) doesn't flatten the rest
-            # to one colour — spreads quiet->blue, typical->mid, loud->red, with
-            # outliers clipped to red.
-            def _energy(pt):
-                return pt[2] if len(pt) > 2 else (abs(pt[0]) + abs(pt[1])) / 2
-            _sorted_e = sorted(_energy(pt) for pt in self.waveform)
-
-            def _pct(p):
-                if not _sorted_e:
-                    return 0.0
-                return _sorted_e[min(len(_sorted_e) - 1, int(len(_sorted_e) * p))]
-            energy_lo = _pct(0.10)              # floor -> blue
-            energy_rng = max(_pct(0.97) - energy_lo, 1e-6)  # robust ceiling -> red
-
-            for i, pt in enumerate(self.waveform):
-                min_val, max_val = pt[0], pt[1]
-                # Each point is one of n_points equal bins tiling [0, video_duration];
-                # place it at the bin CENTER (i+0.5) so a transient lands on its real
-                # time instead of up to a full bin (~0.7s) early.
-                time_pos = ((i + 0.5) / n_points) * self.video_duration
-                x = time_pos * self.pixels_per_second
-
-                # Skip if beyond visible area
-                if x > total_width:
-                    break
-
-                # Map energy across [floor, ceiling] percentile range, clamped.
-                norm = (_energy(pt) - energy_lo) / energy_rng
-                norm = 0.0 if norm < 0 else (1.0 if norm > 1 else norm)
-                amplitude_index = min(255, int(norm * 255))
-              
-                # Get color
-                if self.waveform_colors and amplitude_index < len(self.waveform_colors):
-                    color = self.waveform_colors[amplitude_index]
-                    color.setAlpha(min(255, color.alpha() + 50))
-                else:
-                    color = QColor(47, 129, 247, 200)
-                
-                # Calculate y positions
-                y_center = waveform_y + height // 2
-                y_min = y_center + int(min_val * height // 2 * 0.8)
-                y_max = y_center + int(max_val * height // 2 * 0.8)
-                
-                # Draw vertical line - ensure minimum width
-                line_width = max(2, self.pixels_per_second / (len(self.waveform) / self.video_duration))
-                pen = QPen(color, min(5, line_width))  # Cap at 5 pixels thick
-                self.addLine(x, y_min, x, y_max, pen)
+            lane = WaveformLane(self.waveform, self.video_duration, self.pixels_per_second,
+                                total_width, height, self.waveform_colors)
+            lane.setPos(0, waveform_y)
+            self.addItem(lane)
 
             # Peak markers — small amber triangles above every peak the AUDIO
             # WAVEFORM ◀▶ arrows will jump to, so the sensitivity is visible as
@@ -515,25 +469,10 @@ class SignalTimelineScene(QGraphicsScene):
         if n == 0 or self.video_duration <= 0:
             return []
 
-        def _energy(pt):
-            return pt[2] if len(pt) > 2 else (abs(pt[0]) + abs(pt[1])) / 2
-
-        energies = [_energy(pt) for pt in wf]
-        s = sorted(energies)
-
-        def _pct(p):
-            return s[min(len(s) - 1, int(len(s) * p))]
-
-        lo = _pct(0.10)
-        rng = max(_pct(0.97) - lo, 1e-6)
-
-        series = []
-        for i, e in enumerate(energies):
-            norm = (e - lo) / rng
-            norm = 0.0 if norm < 0 else (1.0 if norm > 1 else norm)
-            t = ((i + 0.5) / n) * self.video_duration   # bin center (matches draw)
-            series.append((t, norm))
-        return series
+        energies = [pt[2] if len(pt) > 2 else (abs(pt[0]) + abs(pt[1])) / 2 for pt in wf]
+        levels = bin_levels(energies)                  # as the lane colours them
+        times = (np.arange(n) + 0.5) / n * self.video_duration   # bin centre
+        return list(zip(times.tolist(), levels.tolist()))
 
     def _waveform_peaks(self):
         """Peak times in the waveform whose normalized energy clears the
@@ -1092,17 +1031,30 @@ class SignalTimelineScene(QGraphicsScene):
         if hasattr(self, 'current_time_seconds'):
             self.set_current_time(self.current_time_seconds)
         
-        # Restore view zoom/scroll
-        if views and old_transform:
+        # Restore view zoom/scroll. The view's zoom was set for the
+        # pixels-per-second the scene was last drawn at, so what to keep is
+        # what the view showed - pixels per second on screen. When the scene's
+        # own scale has not changed, the transform is already right and is
+        # left alone.
+        #
+        # This used to compare the new scene's width with that width divided
+        # by the zoom, which differ whenever the view is zoomed at all, and
+        # then multiply the zoom by itself: every rebuild squared it (0.66,
+        # 0.43, 0.19, 0.03). A filter toggle, a layer, a search result or the
+        # waveform arriving each rebuild, so a few of them shrank a zoomed-out
+        # video to a few pixels - its bars gone from the timeline - or blew a
+        # zoomed-in one past anything on it, and the wheel took dozens of
+        # notches to undo it.
+        if views and old_transform is not None:
             view = views[0]
-            m11 = old_transform.m11()
-            old_visible_width = self.sceneRect().width() / m11 if m11 != 0 else 1
-            if old_visible_width > 0 and abs(old_visible_width - width) > 10:
-                scale_factor = width / old_visible_width
-                view.setTransform(old_transform.scale(scale_factor, 1.0))
+            drawn_for = getattr(self, "_view_pps", None) or self.pixels_per_second
+            if self.pixels_per_second > 0 and drawn_for != self.pixels_per_second:
+                view.setTransform(old_transform.scale(
+                    drawn_for / self.pixels_per_second, 1.0))
                 view.horizontalScrollBar().setValue(old_h_scroll)
                 # Zoom changed — re-pick the ruler interval for it.
                 self.draw_time_markers()
+        self._view_pps = self.pixels_per_second
 
         print(f"✅ Timeline rebuilt successfully, "
               f"{len(self.row_labels)} lanes, final height={self.sceneRect().height()}")
@@ -2104,12 +2056,7 @@ class SignalTimelineScene(QGraphicsScene):
     @staticmethod
     def _format_time_label(second):
         """H:MM:SS once we're past an hour, MM:SS otherwise."""
-        second = int(second)
-        h, rem = divmod(second, 3600)
-        m, s = divmod(rem, 60)
-        if h:
-            return f"{h:d}:{m:02d}:{s:02d}"
-        return f"{m:02d}:{s:02d}"
+        return clock(int(second))
 
     def draw_time_markers(self):
         """Draw the time ruler. The interval adapts to the *effective* zoom
@@ -2349,8 +2296,7 @@ class SignalTimelineScene(QGraphicsScene):
     def _update_selection_label(self, t0: float, t1: float, x0: float):
         """Update the time-range label that floats above the selection rect."""
         def fmt(t):
-            m, s = divmod(t, 60)
-            return f"{int(m):02d}:{s:05.2f}"
+            return clock(t, 2)
 
         duration = t1 - t0
         text = f"{fmt(t0)} → {fmt(t1)}  ({duration:.2f}s)  — drag to add"
@@ -2834,6 +2780,30 @@ class SignalTimelineScene(QGraphicsScene):
 
         return y_pos + self.layer_height + self.layer_spacing
 
+# How far the wheel zooms. Out: until the whole video fills the view, and no
+# further - past that the timeline only shrinks into empty space and the next
+# zoom in takes a dozen notches to get back. In: until a second is this many
+# screen pixels - a 25 fps frame is then 40 px and a 50 ms waveform bin 50 px;
+# deeper than that shows nothing the media has.
+MAX_PX_PER_SECOND = 1000.0
+
+
+def clamp_zoom(current_pps: float, factor: float, view_width: float,
+               duration: float, max_pps: float = MAX_PX_PER_SECOND) -> float:
+    """The zoom factor to apply instead of ``factor``, so the effective
+    pixels per second stays between the whole video in ``view_width`` and
+    ``max_pps``. 1.0 means: already at the limit, do nothing."""
+    if current_pps <= 0:
+        return factor
+    lo = view_width / duration if duration > 0 and view_width > 0 else 0.0
+    hi = max(max_pps, lo)
+    wanted = min(hi, max(lo, current_pps * factor))
+    # Moving away from a limit is always allowed, even from outside it.
+    if (factor > 1 and current_pps >= hi) or (factor < 1 and current_pps <= lo):
+        return 1.0
+    return wanted / current_pps
+
+
 class SignalTimelineView(QGraphicsView):
     """Custom view with smooth zooming and panning"""
 
@@ -2934,6 +2904,40 @@ class SignalTimelineView(QGraphicsView):
         """When view is resized, fit the scene vertically"""
         super().resizeEvent(event)
         self._fit_vertical()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "_opened_at_playhead", False):
+            self._opened_at_playhead = True
+            # After the layout has given the view its real width.
+            QTimer.singleShot(0, self._open_at_playhead)
+
+    def _open_at_playhead(self):
+        """Open on the playhead, not on the middle of the video.
+
+        A QGraphicsView shows a scene wider than itself centred, so a film
+        opened on its middle: 621-632 s of a 1249 s video, with the playhead
+        at 0 and the clips at the start out of sight until something scrolled.
+        Nothing did before Play or a click, and the timeline read as empty.
+        Deliberately not ensure_time_visible: that honours the Follow
+        Playhead toggle, which is about playback, not where the view opens.
+        """
+        scene = self.scene()
+        if scene is None:
+            return
+        pps = float(getattr(scene, "pixels_per_second", 0) or 0)
+        if pps <= 0:
+            return
+        x = float(getattr(scene, "current_time_seconds", 0) or 0) * pps
+        vp = self.viewport().rect()
+        left = self.mapToScene(vp.topLeft()).x()
+        right = self.mapToScene(vp.topRight()).x()
+        width = right - left
+        if width <= 0 or left <= x <= right:
+            return
+        # The playhead 35% in from the left, as ensure_time_visible puts it;
+        # at 0 the scroll bar stops at the start.
+        self.centerOn(x + width * 0.15, self.mapToScene(vp.center()).y())
 
     def _fit_vertical(self):
         """Scale scene to fit view height, down to MIN_LANE_PITCH_PX per lane"""
@@ -3046,10 +3050,15 @@ class SignalTimelineView(QGraphicsView):
         old_anchor = self.transformationAnchor()
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
 
-        if event.angleDelta().y() > 0:
-            self.scale(zoom_factor, 1.0)
-        else:
-            self.scale(1.0 / zoom_factor, 1.0)
+        factor = zoom_factor if event.angleDelta().y() > 0 else 1.0 / zoom_factor
+        scene = self.scene()
+        if scene is not None:
+            factor = clamp_zoom(
+                float(getattr(scene, "pixels_per_second", 0) or 0) * self.transform().m11(),
+                factor, float(self.viewport().width()),
+                float(getattr(scene, "video_duration", 0) or 0))
+        if abs(factor - 1.0) > 1e-6:
+            self.scale(factor, 1.0)
 
         self.setTransformationAnchor(old_anchor)
 

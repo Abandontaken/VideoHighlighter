@@ -28,7 +28,8 @@ from PySide6.QtCore import Qt, QRect, QRectF, Signal, Slot, QPointF, QTimer, QPo
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QPainter, QFont, QPainterPath,
     QLinearGradient, QRadialGradient, QCursor, QAction,
-    QPainterPath, QFontMetrics, QDrag, QPixmap, QIntValidator
+    QPainterPath, QFontMetrics, QDrag, QPixmap, QIntValidator,
+    QKeySequence, QShortcut
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -45,6 +46,7 @@ from modules import i18n
 from modules.ui.collapsible import CollapsibleSection
 from modules.ui import fit
 from modules.ui.fit import fit_icon_button, fit_width
+from modules.ui.flow_layout import FlowRow
 from modules.ui.theme import DARK as THEME
 from modules.ui import icons as ui_icons
 # Building this window blocks the GUI thread for several seconds, so it reports
@@ -53,6 +55,8 @@ from modules.ui import icons as ui_icons
 # knowledge of who, if anyone, is watching.
 from modules.system import startup_splash
 from modules.media.audio_device import follow_system_default
+from modules.media.timecode import clock
+from video_ai_editor.clock_field import ClockField
 from video_ai_editor.video_preview import TimelineWithPreview
 from video_ai_editor.bbox_overlay import AnnotatedVideoManager
 from video_ai_editor.timeline_export import (
@@ -67,7 +71,7 @@ from video_ai_editor.timeline_export import (
     record_start_for_format,
     skipped_note,
 )
-from video_ai_editor.waveform import WaveformVisualizer
+from video_ai_editor.waveform import WaveformVisualizer, is_coarse as waveform_is_coarse
 from video_ai_editor.timeline_bars import TimelineBar
 from video_ai_editor.signal_timeline import SignalTimelineScene, SignalTimelineView
 from video_ai_editor.edit_timeline import EditTimelineScene
@@ -588,9 +592,16 @@ class SignalTimelineWindow(QMainWindow):
         # silently dropped and the waveform never appeared.
         self.waveform_ready.connect(self._on_waveform_ready)
 
-        # Start background extraction if we don't have cached waveform
+        # Start background extraction if we don't have cached waveform, or
+        # the cached one is too coarse to line up with the playhead (a cache
+        # from before video_ai_editor.waveform.BINS_PER_SECOND; it stays on
+        # screen until the finer one replaces it).
         if not self.waveform or len(self.waveform) == 0:
             debug_log(f"  ⚠️ No cached waveform or empty waveform, starting extraction...")
+            self.init_waveform()
+        elif waveform_is_coarse(self.waveform, self.video_duration):
+            debug_log(f"  ⚠️ Cached waveform is coarse ({len(self.waveform)} points over "
+                      f"{self.video_duration:.0f}s), extracting a finer one...")
             self.init_waveform()
         else:
             debug_log(f"  ✅ Using cached waveform ({len(self.waveform)} points)")
@@ -847,9 +858,11 @@ class SignalTimelineWindow(QMainWindow):
         # ──────────────────────────────────────────────────────────
         # Transport controls
         # ──────────────────────────────────────────────────────────
-        controls_widget = QWidget()
-        controls_layout = QHBoxLayout(controls_widget)
-        controls_layout.setContentsMargins(0, 4, 0, 0)
+        # A row that wraps. As one unbreakable line it was 848px wide, and a
+        # dock cannot be narrower than its widest row — so the preview alone
+        # claimed most of a laptop screen before the timeline got any.
+        controls_widget = FlowRow(spacing=6, margins=(0, 4, 0, 0))
+        controls_layout = controls_widget.flow
 
         # Play button
         self.play_btn = QPushButton("▶ Play")
@@ -875,19 +888,17 @@ class SignalTimelineWindow(QMainWindow):
         self.time_slider.sliderPressed.connect(self._on_slider_pressed)
         self.time_slider.sliderReleased.connect(self._on_slider_released)
         self.time_slider.valueChanged.connect(self.seek_video)
+        # It takes whatever its line has spare; this is the least it is any
+        # use at, and so the point at which it moves to a line with more.
+        self.time_slider.setMinimumWidth(120)
         controls_layout.addWidget(self.time_slider)
 
-        # Time label
-        self.preview_time_label = QLabel("00:00 / 00:00")
-        self.preview_time_label.setStyleSheet("""
-            QLabel {
-                color: #a0ffa0; font-family: 'Consolas', monospace;
-                font-weight: bold; padding: 8px; background-color: #141414;
-                border-radius: 4px; min-width: 120px;
-                qproperty-alignment: AlignCenter;
-            }
-        """)
+        # The clock, which a click turns into "go to time" (video_ai_editor/clock_field.py).
+        self.preview_time_label = ClockField()
+        self.preview_time_label.jumpRequested.connect(self._jump_to_time)
         controls_layout.addWidget(self.preview_time_label)
+        go_to_time = QShortcut(QKeySequence("Ctrl+G"), self)
+        go_to_time.activated.connect(self.preview_time_label.start_editing)
 
         # Show detections checkbox
         self.show_detections_checkbox = QCheckBox("Show Detections")
@@ -1354,9 +1365,7 @@ class SignalTimelineWindow(QMainWindow):
             lines.append('')
         
         # ── Timestamp ──
-        mins, secs = divmod(int(time_seconds), 60)
-        ms = int((time_seconds % 1) * 100)
-        lines.insert(0, f'<b style="color: #00ffff; font-size: 13px;">{mins:02d}:{secs:02d}.{ms:02d}</b>')
+        lines.insert(0, f'<b style="color: #00ffff; font-size: 13px;">{clock(time_seconds, 2)}</b>')
         
         if not actions and not objects:
             lines.append('<span style="color: #666;">No detections</span>')
@@ -1371,6 +1380,33 @@ class SignalTimelineWindow(QMainWindow):
         else:
             self._active_player.play()
             self.play_btn.setText("⏸ Pause")
+        self._log_audio_state("play/pause")
+
+    def _log_audio_state(self, reason):
+        """One debug-log line on where the sound is going, at each jump and
+        play/pause. Sound was reported lost after jumping between scenes with
+        nothing in the log to say why; this is what tells the next one apart:
+        a muted output, a zero volume, a device that moved, a player with no
+        audio track left, or the live player active instead of the shared one.
+        """
+        try:
+            player = self._active_player
+            ao = player.audioOutput()
+            which = "live" if player is not getattr(self, 'video_player', None) else "shared"
+            states = {QMediaPlayer.PlayingState: "playing", QMediaPlayer.PausedState: "paused",
+                      QMediaPlayer.StoppedState: "stopped"}
+            if ao is None:
+                out = "NO audio output"
+            else:
+                out = (f"muted={ao.isMuted()} volume={ao.volume():.2f} "
+                       f"device={ao.device().description()!r}")
+            print(f"🔊 audio [{reason}] t={self.current_time:.2f}s player={which} "
+                  f"{states.get(player.playbackState(), player.playbackState())} "
+                  f"hasAudio={player.hasAudio()} track={player.activeAudioTrack()} "
+                  f"{out} mute_btn={getattr(self, 'mute_btn', None) is not None and self.mute_btn.isChecked()} "
+                  f"slider={getattr(self, 'volume_slider', None) and self.volume_slider.value()}")
+        except Exception as e:  # noqa: BLE001 - a diagnostic never breaks playback
+            print(f"🔊 audio [{reason}] state unreadable: {type(e).__name__}: {e}")
 
     def _on_slider_pressed(self):
         """Hold off position updates while the handle is held."""
@@ -1453,10 +1489,7 @@ class SignalTimelineWindow(QMainWindow):
             self.time_slider.blockSignals(True)
             self.time_slider.setRange(0, int(duration))
             self.time_slider.blockSignals(False)
-            total_seconds = duration // 1000
-            mins = total_seconds // 60
-            secs = total_seconds % 60
-            self.total_duration_str = f"{mins:02d}:{secs:02d}"
+            self.total_duration_str = clock(duration // 1000)
             self.update_time_display(self.video_player.position())
 
             # --- SYNC DIAGNOSTIC ---------------------------------------------
@@ -1483,15 +1516,15 @@ class SignalTimelineWindow(QMainWindow):
                     )
 
     def update_time_display(self, position):
-        current_seconds = position // 1000
-        mins = current_seconds // 60
-        secs = current_seconds % 60
-        current_time_str = f"{mins:02d}:{secs:02d}"
-        
+        current_time_str = clock(position // 1000)
+        # The status bar's precise time follows playback too; it used to move
+        # only on a click or a seek and sat frozen while the video played.
+        if hasattr(self, 'time_label'):
+            self.time_label.setText(clock(position / 1000.0, 3))
         if hasattr(self, 'total_duration_str'):
-            self.preview_time_label.setText(f"{current_time_str} / {self.total_duration_str}")
+            self.preview_time_label.show_time(f"{current_time_str} / {self.total_duration_str}")
         else:
-            self.preview_time_label.setText(f"{current_time_str}")
+            self.preview_time_label.show_time(current_time_str)
 
     def update_play_button(self, state):
         """Update play button based on playback state"""
@@ -1559,7 +1592,7 @@ class SignalTimelineWindow(QMainWindow):
         def extract_waveform():
             print("🎵 [thread] Starting waveform extraction...")
             visualizer = WaveformVisualizer(self.video_path)
-            data = visualizer.extract_waveform(num_points=2000)
+            data = visualizer.extract_waveform()
 
             if data is None:
                 print("❌ [thread] extract_waveform() returned None")
@@ -2528,6 +2561,12 @@ class SignalTimelineWindow(QMainWindow):
         """Initialize the user interface with edit timeline"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
+        # A floor for the timeline itself. Now that its toolbar wraps, nothing
+        # in here needs more than a few hundred pixels — and a main window
+        # shrinks its centre to the minimum before it takes anything from the
+        # docks. Left alone the timeline was squeezed to a sliver beside a
+        # preview at full width, and the toolbar wrapped to ten lines.
+        central_widget.setMinimumWidth(self.TIMELINE_MIN_WIDTH)
         
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(8, 8, 8, 8)
@@ -2540,6 +2579,11 @@ class SignalTimelineWindow(QMainWindow):
 
         # Create splitter for main content
         splitter = QSplitter(Qt.Orientation.Vertical)
+        # Neither timeline can be dragged out of sight. Collapsible, as a
+        # QSplitter is by default, the handle taken to the bottom left the
+        # edit timeline 0 px tall: every clip gone, and nothing but a thin
+        # handle to say where they went.
+        splitter.setChildrenCollapsible(False)
         
         # Create signal timeline view (top)
         signal_widget = QWidget()
@@ -2631,6 +2675,9 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.edit_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.edit_view.setFixedHeight(120)
+        # An edit reads from its start: narrower than the view, it sits at
+        # the left rather than floating in the middle.
+        self.edit_view.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.edit_view.setAcceptDrops(True)
         self.edit_view.viewport().setAcceptDrops(True)
         self.edit_view.setStyleSheet(f"""
@@ -2654,9 +2701,22 @@ class SignalTimelineWindow(QMainWindow):
             
             # Add as a dock widget on the bottom
             llm_dock = QDockWidget("LLM Assistant", self)
-            llm_dock.setWidget(self.llm_chat)
+            # In a scroll area, so the dock can be shorter than its contents.
+            # Settings, search and a conversation stacked up need 484px, and a
+            # dock's minimum is its contents' minimum — added to the timeline
+            # above it, that asked for more height than a laptop screen has.
+            # With room it fills the dock exactly as before; without, it
+            # scrolls instead of pushing the window off the screen.
+            llm_scroll = QScrollArea()
+            llm_scroll.setWidgetResizable(True)
+            llm_scroll.setFrameShape(QScrollArea.NoFrame)
+            llm_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            llm_scroll.setWidget(self.llm_chat)
+            llm_dock.setWidget(llm_scroll)
             self.addDockWidget(Qt.BottomDockWidgetArea, llm_dock)
             self._llm_dock = llm_dock
+            llm_dock.topLevelChanged.connect(self._docks_moved_by_user)
+            llm_dock.dockLocationChanged.connect(self._docks_moved_by_user)
         except ImportError:
             pass  # LLM modules not installed
 
@@ -2710,6 +2770,9 @@ class SignalTimelineWindow(QMainWindow):
         try:
             preview_dock = self.create_video_preview_dock()
             self.addDockWidget(Qt.LeftDockWidgetArea, preview_dock)
+            self._preview_dock = preview_dock
+            preview_dock.topLevelChanged.connect(self._docks_moved_by_user)
+            preview_dock.dockLocationChanged.connect(self._docks_moved_by_user)
         except Exception as e:
             print(f"⚠️ Could not create preview dock: {e}")
             # Continue without preview
@@ -2772,7 +2835,81 @@ class SignalTimelineWindow(QMainWindow):
         super().showEvent(event)
         if not getattr(self, "_dock_balanced", False):
             self._dock_balanced = True
-            QTimer.singleShot(0, self._balance_bottom_dock)
+            QTimer.singleShot(0, self._balance_docks)
+            QTimer.singleShot(0, self._open_edit_at_start)
+
+    def _open_edit_at_start(self):
+        """Open the edit timeline on its first clip.
+
+        A QGraphicsView shows a scene wider than itself centred. The edit
+        scene is at least 1000 px however few clips it holds, so a short edit
+        opened on the empty middle: with three clips the first was a 29 px
+        sliver at the left edge, with one or two short ones none showed at all
+        until the wheel scrolled them back.
+        """
+        view = getattr(self, "edit_view", None)
+        if view is not None:
+            bar = view.horizontalScrollBar()
+            bar.setValue(bar.minimum())
+
+    # The least width the timeline keeps, and the most of the window the
+    # preview takes while the dock sizes are still the window's to choose.
+    TIMELINE_MIN_WIDTH = 560
+    PREVIEW_SHARE = 0.32
+
+    def resizeEvent(self, event):
+        # The dock sizes were chosen for the size the window opened at. A
+        # window opened at 1600px and then maximized would otherwise keep a
+        # preview sized for 1600 — wrapped controls on a 3440px screen.
+        super().resizeEvent(event)
+        if not getattr(self, "_dock_balanced", False):
+            return
+        timer = getattr(self, "_rebalance_timer", None)
+        if timer is None:
+            timer = self._rebalance_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(0)
+            timer.timeout.connect(self._balance_docks)
+        timer.start()
+
+    def event(self, event):
+        # The main window's own pixels are only the bars between its docks, so
+        # a press that lands on no child is the user taking hold of one. From
+        # then on the dock sizes are theirs and a resize leaves them alone.
+        if (event.type() == QEvent.Type.MouseButtonPress
+                and self.childAt(event.position().toPoint()) is None):
+            self._docks_user_sized = True
+        return super().event(event)
+
+    def _docks_moved_by_user(self, *_args):
+        self._docks_user_sized = True
+
+    def _balance_docks(self):
+        if getattr(self, "_docks_user_sized", False):
+            return
+        self._balance_preview_dock()
+        self._balance_bottom_dock()
+
+    def _balance_preview_dock(self):
+        """Size the preview for the window: its controls on one line where
+        there is room, and no more than its share of the width where not.
+
+        On one line the controls want about 850px. On a wide window that is a
+        quarter of it; on a 1080p screen it is nearly half, and the timeline —
+        what this window is for — would get what was left. There the preview
+        gives way and its controls wrap."""
+        dock = getattr(self, "_preview_dock", None)
+        if dock is None or not dock.isVisible() or dock.isFloating():
+            return
+        share = int(self.width() * self.PREVIEW_SHARE)
+        natural = dock.sizeHint().width()
+        target = max(dock.minimumSizeHint().width(), min(natural, share))
+        if dock.width() == target:
+            return
+        try:
+            self.resizeDocks([dock], [target], Qt.Orientation.Horizontal)
+        except Exception as e:
+            print(f"⚠️ Could not balance the preview dock: {e}")
 
     def _balance_bottom_dock(self):
         """Give the LLM dock enough height for a usable chat. Lowering the
@@ -2893,6 +3030,12 @@ class SignalTimelineWindow(QMainWindow):
                 return True
 
             if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+                # A text box's Backspace is a character, not "delete the
+                # selected clips" -- typing a time or a search would eat them.
+                from PySide6.QtWidgets import QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox
+                if isinstance(QApplication.focusWidget(),
+                              (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox)):
+                    return False
                 if (obj == self or
                     (hasattr(self, 'edit_view') and self.edit_view.hasFocus()) or
                     (hasattr(self, 'edit_scene') and len(self.edit_scene.selectedItems()) > 0)):
@@ -2938,13 +3081,12 @@ class SignalTimelineWindow(QMainWindow):
         """One status line: video stats + current edit length. The old info bar
         and the existing status message each showed duration; this merges them
         so Actions/Objects aren't lost to whoever calls showMessage last."""
-        mins, secs = int(self.video_duration // 60), int(self.video_duration % 60)
         try:
             edit_len = self.edit_scene.get_total_duration()
         except Exception:
             edit_len = 0.0
         self.statusBar().showMessage(
-            f"Duration: {mins:02d}:{secs:02d} • Actions: {len(self.action_types)} • "
+            f"Duration: {clock(self.video_duration)} • Actions: {len(self.action_types)} • "
             f"Objects: {len(self.object_classes)} | Edit: {edit_len:.1f}s"
         )
 
@@ -3430,11 +3572,15 @@ class SignalTimelineWindow(QMainWindow):
 
     def create_edit_controls(self):
         """Edit toolbar — buttons grouped playback | clip ops | output, with
-        separators, so the row reads as three tools instead of nine buttons."""
-        controls = QWidget()
-        layout = QHBoxLayout(controls)
-        layout.setSpacing(6)
-        layout.setContentsMargins(4, 2, 4, 2)
+        separators, so the row reads as three tools instead of nine buttons.
+
+        It wraps. Side by side these controls are 1557px, which as a row that
+        could not break was the least the timeline could ever be: wider than
+        the room a 1080p screen has left between the preview and the panels,
+        so there the buttons were squeezed until their labels overlapped. With
+        room to spare it is still the one line it always was."""
+        controls = FlowRow(spacing=6, margins=(4, 2, 4, 2))
+        layout = controls.flow
 
         # -- Playback --
         self.play_edit_btn = QPushButton("Play Edit")
@@ -4377,11 +4523,16 @@ class SignalTimelineWindow(QMainWindow):
         
         if hasattr(self, 'video_player'):
             self._active_player.setPosition(int(self.current_time * 1000))
-        
-        minutes = int(self.current_time // 60)
-        secs = int(self.current_time % 60)
-        msec = int((self.current_time % 1) * 1000)
-        self.time_label.setText(f"{minutes:02d}:{secs:02d}.{msec:03d}")
+
+        self.time_label.setText(clock(self.current_time, 3))
+        self._log_audio_state("jump")
+
+    def _jump_to_time(self, seconds):
+        """A time typed into the clock: the same jump as a click on the
+        timeline, and the clock follows at once, since a paused player may
+        not report its new position."""
+        self.on_time_clicked(float(seconds))
+        self.update_time_display(int(self.current_time * 1000))
 
     def _pause_edit_playback(self):
         """Pause edit playback while preserving playlist state."""
@@ -4430,12 +4581,8 @@ class SignalTimelineWindow(QMainWindow):
         # Update playhead
         self.signal_scene.set_current_time(self.current_time)
         
-        # Update time label
-        minutes = int(self.current_time // 60)
-        seconds = int(self.current_time % 60)
-        ms = int((self.current_time % 1) * 1000)
-        self.time_label.setText(f"{minutes:02d}:{seconds:02d}.{ms:03d}")
-        
+        self.time_label.setText(clock(self.current_time, 3))
+
         # Update detection panel
         self._update_detection_panel(self.current_time)
 
@@ -4626,11 +4773,7 @@ class SignalTimelineWindow(QMainWindow):
         else:
             self.edit_scene.clear_active_clip()
 
-        # Update time label
-        minutes = int(self.current_time // 60)
-        seconds = int(self.current_time % 60)
-        ms      = int((self.current_time % 1) * 1000)
-        self.time_label.setText(f"{minutes:02d}:{seconds:02d}.{ms:03d}")
+        self.time_label.setText(clock(self.current_time, 3))
 
     def _reroute_edit_playback_to(self, clip_index: int, current_pos: float):
         """
@@ -4678,9 +4821,7 @@ class SignalTimelineWindow(QMainWindow):
     def on_clip_double_clicked(self, start_time, end_time):
         self.current_time = start_time
         self.signal_scene.set_current_time(start_time)
-        minutes = int(start_time // 60)
-        seconds = int(start_time % 60)
-        self.time_label.setText(f"Clip: {minutes:02d}:{seconds:02d}")
+        self.time_label.setText(f"Clip: {clock(start_time)}")
         
         self._single_clip_playing = True
         self.play_video_clip(start_time, end_time)
@@ -4761,10 +4902,8 @@ class SignalTimelineWindow(QMainWindow):
         """
         self.update_edit_duration()
 
-        minutes = int(cut_time // 60)
-        seconds = cut_time % 60
         self.statusBar().showMessage(
-            f"✂️  Cut at {minutes:02d}:{seconds:05.2f}  —  "
+            f"✂️  Cut at {clock(cut_time, 2)}  —  "
             f"{len(self.edit_scene.clips)} clips in timeline",
             4000
         )
