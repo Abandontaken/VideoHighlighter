@@ -38,7 +38,7 @@ HAS_EXAMPLE_SEARCH = tools.has_example_search()
 EXPECTED_TOOLS = {
     "get_info", "probe_video", "scan_folder", "get_config",
     "start_highlight_run", "start_visual_search", "more_like_these",
-    "set_timeline_clips", "seek_timeline",
+    "set_timeline_clips", "seek_timeline", "set_overlay", "restart_app",
     "start_expression_scan",
     "get_job", "list_jobs", "cancel_job",
     "dataset_health", "plan_reviewed_video", "add_reviewed_video",
@@ -554,6 +554,35 @@ def test_seek_timeline_says_why_when_the_app_is_not_there(server, video, monkeyp
     assert sent[0][0] == "seek" and sent[0][1]["seconds"] == 1291.5
 
 
+def test_set_overlay_sends_only_what_was_asked(server, video, monkeypatch):
+    import importlib
+    import importlib.util
+    if importlib.util.find_spec("modules.system.live_link") is None:
+        result = call(server, "set_overlay", video_path=video, mode="cache")
+        assert result == {"live": False, "why": "this edition has no live link"}
+        return
+    live_link = importlib.import_module("modules.system.live_link")
+    sent = []
+    monkeypatch.setattr(live_link, "send", lambda cmd, args, **k: sent.append((cmd, args)))
+    result = call(server, "set_overlay", video_path=video, mode="cache", shape="outlines",
+                  seconds=1428)
+    assert result == {"live": False, "why": "the app is not running"}
+    assert sent[0] == ("overlay", {"video_path": video, "mode": "cache",
+                                   "shape": "outlines", "seconds": 1428.0})
+    call(server, "set_overlay", video_path=video, mode="off")
+    assert sent[1][1] == {"video_path": video, "mode": "off"}
+
+
+@pytest.mark.parametrize("kw, match", [
+    ({"mode": "sideways"}, "mode must be"),
+    ({"mode": "cache", "shape": "circles"}, "shape must be"),
+    ({"mode": "cache", "seconds": -1}, "0 or more"),
+])
+def test_set_overlay_refuses_bad_arguments(server, video, kw, match):
+    with pytest.raises(ToolError, match=match):
+        call(server, "set_overlay", video_path=video, **kw)
+
+
 def test_set_timeline_clips_becomes_the_newest_highlight_version(server, video,
                                                                  monkeypatch,
                                                                  tmp_path):
@@ -629,3 +658,75 @@ def test_only_the_protocol_reaches_stdout():
     assert proc.stdout.replace(b"\r\n", b"\n") == b"PROTO\n"
     for noise in (b"noise-print", b"noise-fd", b"noise-child"):
         assert noise in proc.stderr
+
+
+def test_restart_app_waits_until_the_new_app_answers(monkeypatch):
+    import importlib
+    import importlib.util
+    if importlib.util.find_spec("modules.system.live_link") is None:
+        assert tools.restart_app()["why"] == "this edition has no live link"
+        return
+    live_link = importlib.import_module("modules.system.live_link")
+    # Back only once the reopened video is on screen: an answer alone, or a
+    # viewer still being built, is not enough (a command then built a second one).
+    answers = iter([{"restarting": True, "reopen": "v.mp4", "seconds": 3.0},
+                    None, {"timeline_video": None, "viewer_opening": True},
+                    {"timeline_video": "v.mp4", "viewer_opening": False}])
+    sent = []
+    monkeypatch.setattr(live_link, "send",
+                        lambda cmd, args, **k: sent.append(cmd) or next(answers))
+    now = [0.0]
+    out = tools.restart_app(sleep=lambda s: now.__setitem__(0, now[0] + s),
+                            clock=lambda: now[0])
+    assert sent == ["restart", "ping", "ping", "ping"]
+    assert out["live"] and out["reopen"] == "v.mp4" and out["back_after_s"] == 4.0
+
+
+def test_restart_app_reports_a_refusal_and_a_slow_start(monkeypatch):
+    import importlib
+    import importlib.util
+    if importlib.util.find_spec("modules.system.live_link") is None:
+        return
+    live_link = importlib.import_module("modules.system.live_link")
+
+    def refuse(cmd, args, **k):
+        raise live_link.LiveLinkError("Live link failed: Not restarting: a download in progress")
+    monkeypatch.setattr(live_link, "send", refuse)
+    out = tools.restart_app()
+    assert out["live"] is False and "a download" in out["why"]
+
+    monkeypatch.setattr(live_link, "send",
+                        lambda cmd, args, **k: {"restarting": True} if cmd == "restart" else None)
+    now = [0.0]
+    out = tools.restart_app(timeout=10, sleep=lambda s: now.__setitem__(0, now[0] + s),
+                            clock=lambda: now[0])
+    assert out["back_after_s"] is None and "did not answer" in out["why"]
+
+
+
+def test_commands_wait_while_the_viewer_is_still_opening():
+    class Err(Exception):
+        pass
+    calls = []
+
+    def send(cmd, args):
+        calls.append(cmd)
+        if len(calls) < 3:
+            raise Err("Live link failed: RuntimeError: The timeline viewer is still opening; try again")
+        return {"ok": 1}
+    link = type("L", (), {"LiveLinkError": Err, "send": staticmethod(send)})
+    now = [0.0]
+    out = tools._send_when_ready(link, "seek", {}, sleep=lambda s: now.__setitem__(0, now[0] + s),
+                                 clock=lambda: now[0])
+    assert out == {"ok": 1} and calls == ["seek"] * 3
+
+
+def test_other_live_link_errors_are_not_retried():
+    class Err(Exception):
+        pass
+
+    def send(cmd, args):
+        raise Err("Unknown command: seek")
+    link = type("L", (), {"LiveLinkError": Err, "send": staticmethod(send)})
+    with pytest.raises(Err, match="Unknown command"):
+        tools._send_when_ready(link, "seek", {}, sleep=lambda s: None)

@@ -9,6 +9,7 @@ Every result is JSON-able and carries paths, timestamps, scores and text only.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Optional, Sequence
 
 from mcp_server.jobs import Job, JobCancelled, JobManager
@@ -570,6 +571,25 @@ def start_counter_guided_run(jobs: JobManager, video_path: str, roi: Sequence[fl
     return {"job_id": job.id, "status": job.status}
 
 
+# The app turns a command away while its timeline viewer is still being built
+# (seconds on a long video): opening a second one mid-build is what it refuses.
+STILL_OPENING = "still opening"
+
+
+def _send_when_ready(live_link, cmd: str, args: dict, *, wait: float = 60.0,
+                     sleep=time.sleep, clock=time.monotonic):
+    """``live_link.send``, retried while the app says its viewer is still
+    opening; any other answer or error is returned or raised as it came."""
+    start = clock()
+    while True:
+        try:
+            return live_link.send(cmd, args)
+        except live_link.LiveLinkError as e:
+            if STILL_OPENING not in str(e) or clock() - start >= wait:
+                raise
+        sleep(1.0)
+
+
 def show_live(video_path: str, spans: Sequence[Sequence[float]], note: str) -> dict:
     """Put clips on the running app's edit timeline, if an app is listening.
 
@@ -583,7 +603,7 @@ def show_live(video_path: str, spans: Sequence[Sequence[float]], note: str) -> d
     except ImportError:
         return {"live": False, "why": "this edition has no live link"}
     try:
-        result = live_link.send("show_clips", {
+        result = _send_when_ready(live_link, "show_clips", {
             "video_path": video_path, "clips": [list(s) for s in spans], "note": note})
     except live_link.LiveLinkError as e:
         return {"live": False, "why": str(e)}
@@ -646,12 +666,100 @@ def seek_timeline(video_path: str, seconds: float) -> dict:
     except ImportError:
         return {"live": False, "why": "this edition has no live link"}
     try:
-        result = live_link.send("seek", {"video_path": path, "seconds": seconds})
+        result = _send_when_ready(live_link, "seek", {"video_path": path, "seconds": seconds})
     except live_link.LiveLinkError as e:
         return {"live": False, "why": str(e)}
     if result is None:
         return {"live": False, "why": "the app is not running"}
     return {"live": True, **result}
+
+
+OVERLAY_MODES = ("off", "cache", "realtime", "precomp")
+OVERLAY_SHAPES = ("boxes", "outlines")
+
+
+def set_overlay(video_path: str, mode: str = "cache", shape: Optional[str] = None,
+                seconds: Optional[float] = None) -> dict:
+    """Switch the running app's timeline viewer overlay for ``video_path``.
+
+    ``mode``: off, cache (detections from the analysis cache), realtime (the
+    current frame recognised live) or precomp (the pre-rendered annotated
+    video). ``shape``: boxes or outlines, for the cache and realtime modes;
+    omitted keeps the viewer's choice. ``seconds`` also moves the playhead.
+    """
+    path = _existing_file(video_path)
+    mode = str(mode or "").strip().lower()
+    if mode not in OVERLAY_MODES:
+        raise ValueError(f"mode must be one of {OVERLAY_MODES}")
+    if shape is not None:
+        shape = str(shape).strip().lower()
+        if shape not in OVERLAY_SHAPES:
+            raise ValueError(f"shape must be one of {OVERLAY_SHAPES}")
+    if seconds is not None and float(seconds) < 0:
+        raise ValueError("seconds must be 0 or more")
+    try:
+        live_link = _edition_module("modules.system.live_link")
+    except ImportError:
+        return {"live": False, "why": "this edition has no live link"}
+    args = {"video_path": path, "mode": mode}
+    if shape is not None:
+        args["shape"] = shape
+    if seconds is not None:
+        args["seconds"] = float(seconds)
+    try:
+        result = _send_when_ready(live_link, "overlay", args)
+    except live_link.LiveLinkError as e:
+        return {"live": False, "why": str(e)}
+    if result is None:
+        return {"live": False, "why": "the app is not running"}
+    return {"live": True, **result}
+
+
+def restart_app(wait: bool = True, timeout: float = 120.0, *,
+                sleep=time.sleep, clock=time.monotonic) -> dict:
+    """Ask the running app to close and start again (so code changed on disk
+    is what runs), reopening the video and moment its timeline viewer showed.
+
+    The app refuses while a run, analysis or download is in progress, and says
+    which. With ``wait`` this returns once the new app answers, or says it has
+    not within ``timeout`` seconds.
+    """
+    try:
+        live_link = _edition_module("modules.system.live_link")
+    except ImportError:
+        return {"live": False, "why": "this edition has no live link"}
+    try:
+        result = live_link.send("restart", {}, timeout=30.0)
+    except live_link.LiveLinkError as e:
+        return {"live": False, "why": str(e)}
+    if result is None:
+        return {"live": False, "why": "the app is not running"}
+    out = {"live": True, **result}
+    if not wait:
+        return out
+    # The old app closes ~0.3 s after answering; give it time to be gone before
+    # a ping could still reach it.
+    # Back means answering and, when a video was to be reopened, showing it:
+    # a command sent before that would find no viewer and open a second one.
+    want = os.path.normcase(os.path.abspath(result["reopen"])) if result.get("reopen") else None
+    start = clock()
+    sleep(2.0)
+    while clock() - start < timeout:
+        try:
+            ping = live_link.send("ping", {}, timeout=5.0)
+        except live_link.LiveLinkError:
+            ping = None
+        if ping is not None:
+            shown = ping.get("timeline_video")
+            ready = not ping.get("viewer_opening") and (
+                want is None or (shown and os.path.normcase(os.path.abspath(shown)) == want))
+            if ready:
+                out["back_after_s"] = round(clock() - start, 1)
+                return out
+        sleep(1.0)
+    out["back_after_s"] = None
+    out["why"] = f"the app did not answer within {timeout:.0f} s; it may still be starting"
+    return out
 
 
 def get_job(jobs: JobManager, job_id: str, log_lines: int = 20) -> dict:

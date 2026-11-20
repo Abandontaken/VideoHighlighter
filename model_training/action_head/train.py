@@ -103,11 +103,13 @@ def _utf8_stdout() -> None:
             pass
 
 
-def default_cache(data_path: str, encoder_id: str, frames: int) -> str:
+def default_cache(data_path: str, encoder_id: str, frames: int, views: str = "whole") -> str:
     from modules.system import app_paths
     digest = hashlib.sha1(os.path.abspath(data_path).lower().encode("utf-8")).hexdigest()[:12]
+    # Whole-frame caches keep their old name, so existing ones are still found.
+    tag = "" if views == "whole" else "-" + views.replace("+", "-")
     return os.path.join(app_paths.user_data_dir(), "cache", "action_head",
-                        f"{digest}-{encoder_id}-{frames}f.npz")
+                        f"{digest}-{encoder_id}-{frames}f{tag}.npz")
 
 
 def default_frame_cache(data_path: str) -> str:
@@ -156,7 +158,8 @@ def group_folds(strat: np.ndarray, groups: np.ndarray, folds: int, seed: int) ->
 
 
 def out_of_fold(x, targets, groups, splits, steps, seed, log,
-                x_extra=None, groups_extra=None, should_stop=None, models=None):
+                x_extra=None, groups_extra=None, should_stop=None, models=None,
+                device=None):
     """Held-out scores for every clip, and for ``x_extra`` (test clips) the
     mean over the fold heads that never saw the clip's source video (NaN when
     none qualifies). Each fold's head is appended to ``models`` when given."""
@@ -168,7 +171,8 @@ def out_of_fold(x, targets, groups, splits, steps, seed, log,
     extra_n = np.zeros(n_extra)
     for i, (tr, te) in enumerate(splits, 1):
         _check(should_stop)
-        model = H.train_head(x[tr], targets[tr], n_classes, steps=steps, seed=seed)
+        model = H.train_head(x[tr], targets[tr], n_classes, steps=steps, seed=seed,
+                             device=device)
         if models is not None:
             models.append(model)
         scores[te] = H.predict_proba(model, x[te])
@@ -213,6 +217,10 @@ def main(argv=None, *, log: Callable[[str], None] = print,
     ap.add_argument("--out", default=None, help="output folder (default: models/actions/<name>)")
     ap.add_argument("--name", default=DEFAULT_NAME)
     ap.add_argument("--frames", type=int, default=4)
+    ap.add_argument("--views", default="whole", choices=("whole", "whole+tiles"),
+                    help="what of each frame the head sees: the whole frame, or the whole "
+                         "frame plus its quarters and centre (views.py; six encoder passes "
+                         "per frame, in training and in use)")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--steps", default=DEFAULT_STEPS,
                     help="training lengths to compare on held-out videos")
@@ -238,7 +246,9 @@ def main(argv=None, *, log: Callable[[str], None] = print,
                     help="each block below the top trains at this times the one above")
     ft.add_argument("--ft-head-lr", type=float, default=2e-4)
     ft.add_argument("--ft-batch", type=int, default=16, help="clips per training step")
-    ft.add_argument("--device", default="auto", help="auto (Intel, then NVIDIA), xpu, cuda or cpu")
+    ap.add_argument("--device", default="auto",
+                    help="where training runs: auto (Intel, then NVIDIA, else the processor "
+                         "for the head; fine-tuning needs a card), xpu, cuda or cpu")
     ft.add_argument("--frame-cache", default=None,
                     help="folder for the decoded frames (default: in the app's data folder)")
     args = ap.parse_args(argv)
@@ -374,12 +384,20 @@ def _train(args, log, should_stop) -> int:
     from modules.vision import frame_encoder
 
     started = time.time()
+    try:
+        args.head_device = H.head_device(getattr(args, "device", "auto"))
+    except ValueError as e:
+        log(f"❌ {e}")
+        return 1
     finetuning = args.finetune_blocks > 0
     FT = device = None
     if finetuning:
         from model_training.action_head import finetune as FT
         if args.frames != 4:
             log("❌ Fine-tuning scores 4 frames per clip, as the app does; leave --frames at 4")
+            return 1
+        if getattr(args, "views", "whole") != "whole":
+            log("❌ Fine-tuning reads whole frames only; leave --views at whole")
             return 1
         try:
             device = FT.resolve_device(args.device)
@@ -406,8 +424,12 @@ def _train(args, log, should_stop) -> int:
     if encoder is None:
         log("❌ The frame encoder is not available; see the lines above")
         return 1
-    cache = Fx.FeatureCache(args.cache or default_cache(args.data_path, encoder.encoder_id, args.frames),
-                            encoder.encoder_id, args.frames, encoder.dims)
+    from model_training.action_head import views as V
+    views = V.check(getattr(args, "views", V.WHOLE))
+    tokens = V.tokens(args.frames, views)
+    cache = Fx.FeatureCache(args.cache or default_cache(args.data_path, encoder.encoder_id,
+                                                        args.frames, views),
+                            encoder.encoder_id, tokens, encoder.dims)
     n = len(clips)
     paths = [c.path for c in clips + extra]
     frame_cache = shared_probe = None
@@ -421,7 +443,7 @@ def _train(args, log, should_stop) -> int:
         _encode_from_frames(frame_cache, keys, encoder, cache, log, should_stop)
         shared_probe = encoder.encode_pixels(frame_encoder.probe_pixels())[0]
     x_all, ok = Fx.encode_clips(paths, args.data_path, encoder,
-                                cache, log=log, should_stop=should_stop)
+                                cache, log=log, should_stop=should_stop, views=views)
     _check(should_stop)
     if finetuning:
         # Training needs the card's memory; the shared encoder's work is done.
@@ -447,7 +469,8 @@ def _train(args, log, should_stop) -> int:
         f"{len(classes)} classes, {n_videos} source videos")
 
     folds = group_folds(strat, groups, args.folds, args.seed)
-    log(f"Scoring on unseen source videos ({len(folds)} folds)")
+    log(f"Scoring on unseen source videos ({len(folds)} folds, heads trained on "
+        f"{args.head_device})")
     single = targets.sum(1) == 1
     best = None
     for steps in [int(s) for s in str(args.steps).split(",") if s.strip()]:
@@ -456,7 +479,7 @@ def _train(args, log, should_stop) -> int:
         scores, scores_extra = out_of_fold(x, targets, groups, folds, steps, args.seed, log,
                                            x_extra=x_extra if extra else None,
                                            groups_extra=g_extra, should_stop=should_stop,
-                                           models=fold_heads)
+                                           models=fold_heads, device=args.head_device)
         acc = _single_accuracy(scores, targets, single)
         log(f"  {steps} steps: held-out single-action accuracy {acc:.3f}")
         if best is None or acc > best[1] + 1e-9:
@@ -471,7 +494,7 @@ def _train(args, log, should_stop) -> int:
     if in_train.any() and in_val.any():
         log("\nScoring val/ as the dataset defines it (training on train/ only)")
         model = H.train_head(x[in_train], targets[in_train], len(classes), steps=steps,
-                             seed=args.seed)
+                             seed=args.seed, device=args.head_device)
         val_pred = H.predict_proba(model, x[in_val]).argmax(1)
         shared = np.isin(groups[in_val], groups[in_train])
         val_scores = {"clips": int(in_val.sum()),
@@ -508,10 +531,11 @@ def _train(args, log, should_stop) -> int:
 
     _check(should_stop)
     log(f"\nTraining the saved head on all {len(clips)} clips ({steps} steps)")
-    model = H.train_head(x, targets, len(classes), steps=steps, seed=args.seed)
+    model = H.train_head(x, targets, len(classes), steps=steps, seed=args.seed,
+                         device=args.head_device)
     os.makedirs(out, exist_ok=True)
     head_path = os.path.join(out, HEAD_FILE)
-    H.export_onnx(model, head_path, args.frames)
+    H.export_onnx(model, head_path, tokens)
     check = H.onnx_proba(H.load_onnx_session(head_path), x[:64])
     drift = float(np.abs(check - H.predict_proba(model, x[:64])).max())
     if drift > 1e-4:
@@ -584,7 +608,8 @@ def _finetune_and_save(FT, run):
     _check(r.should_stop)
     log(f"\nFinal model: training the head on all {len(targets)} clips ({r.steps} steps), then "
         f"fine-tuning with it ({_epochs(ft['epochs'])})")
-    head0 = H.train_head(r.x, targets, len(classes), steps=r.steps, seed=args.seed)
+    head0 = H.train_head(r.x, targets, len(classes), steps=r.steps, seed=args.seed,
+                         device=args.head_device)
     final = FT.Settings(**{**FT.settings_dict(settings), "epochs": ft["epochs"]})
     tower, head, _ = FT.finetune(base_vm, head0, r.frame_cache, r.rows, targets, final, device,
                                  log=log, check=lambda: _check(r.should_stop), label="final ")
@@ -643,7 +668,9 @@ def _meta(args, encoder_id, dims, classes, ev, steps, folds, n_clips, n_videos, 
         "encoder": encoder_id,
         "frames": args.frames,
         "input": f"features [N, frames, {dims}]: frame encoder vectors, "
-                 f"frames evenly across the clip",
+                 f"frames evenly across the clip"
+                 + ("" if getattr(args, "views", "whole") == "whole" else
+                    ", each followed in turn by its quarters and centre (views.py)"),
         "output": "logits [N, classes]; a sigmoid gives each action's own score, and an "
                   "action is detected when its score reaches its trust threshold",
         "activation": "sigmoid",
@@ -661,6 +688,11 @@ def _meta(args, encoder_id, dims, classes, ev, steps, folds, n_clips, n_videos, 
         "val_folder": val_scores,
         "per_class": per_class,
         "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        # What of each frame was encoded (views.py): the head reads frames x
+        # per-frame views vectors per clip, in views.expand's order. Written
+        # only when it is not whole frames, which a head without it is, so
+        # whole-frame heads are as they always were.
+        **({} if getattr(args, "views", "whole") == "whole" else {"views": args.views}),
     }
 
 
