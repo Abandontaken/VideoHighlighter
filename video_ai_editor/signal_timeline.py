@@ -40,10 +40,11 @@ class SignalTimelineScene(QGraphicsScene):
     # Opacity range motion bars are shaded across, weakest to strongest. The
     # floor keeps the weakest bar visible as something to grab.
     MOTION_ALPHA_RANGE = (90, 255)
-    # Seconds before a motion peak that count towards its strength. The
-    # detector stamps a peak on the last spike before the picture goes still,
-    # so the burst that made it is just behind the timestamp, not on it.
-    MOTION_PEAK_LOOKBACK = 2.0
+    # Seconds before a motion peak that count towards its strength. Peaks used
+    # to be stamped on the last spike before the picture went still, with the
+    # burst behind them; since 2026-11-20 a peak is the top of the curve
+    # itself, so only its own half-second bin counts.
+    MOTION_PEAK_LOOKBACK = 0.5
 
     time_clicked = Signal(float)
     time_dragged = Signal(float)
@@ -143,6 +144,9 @@ class SignalTimelineScene(QGraphicsScene):
         #    (`<video>_faces.json`), not in cache_data, so it is read here and
         #    kept apart: reload_cache_data must not drop it.
         self.expressions: dict = {}
+        # Per class, shown or hidden from the Layers panel; a class not in here
+        # is shown, so a new scan's classes appear without a step.
+        self.visible_expressions: dict = {}
         self.expression_merge_gap = 2.0  # seconds — one sample a second, so
         #                                  a single unread frame is not a cut
         self._load_expressions()
@@ -160,7 +164,7 @@ class SignalTimelineScene(QGraphicsScene):
             ('visual_search', [f"Search: {q}" for q in self.visual_queries]),
             ('expressions', ['Expressions']),
             ('scenes', ['Shots']),
-            ('motion', ['Motion Events', 'Motion Peaks']),
+            ('motion', ['Motion Events', 'Motion Peaks', 'Motion Stops']),
             ('audio', ['Audio Peaks']),
             ('highlights', ['Final Highlights']),
             # Last, so it sits at the bottom of the stack — as close as the
@@ -202,6 +206,7 @@ class SignalTimelineScene(QGraphicsScene):
             'scenes': QColor(200, 200, 100),
             'motion_events': QColor(255, 150, 50),
             'motion_peaks': QColor(255, 200, 100),
+            'motion_stops': QColor(120, 190, 255),
             'audio_peaks': QColor(150, 100, 255),
             'highlights': QColor(50, 200, 50),
             'visual_search': QColor(255, 100, 255),
@@ -241,8 +246,18 @@ class SignalTimelineScene(QGraphicsScene):
         self._selection_end_time = None    # float seconds
         self._selection_active = False     # True = selection exists and can be dragged
 
+        # Layer ticks the user set by hand, saved with the filters (see
+        # save_filters); the Layers panel starts from these.
+        self.chosen_layers: dict = {}
+        self._saved_rows: dict = {}
         self.load_filters()
         self.build_timeline()
+
+    def choose_layer(self, layer_name, visible):
+        """A layer ticked or unticked by hand: shown or hidden, and remembered."""
+        self.visible_layers[layer_name] = bool(visible)
+        self.chosen_layers[layer_name] = bool(visible)
+        self.save_filters()
 
     def generate_waveform_colors(self):
         """Generate color gradient for waveform based on amplitude"""
@@ -436,10 +451,16 @@ class SignalTimelineScene(QGraphicsScene):
         self.action_types = self._extract_action_types()
         self.object_classes = self._extract_object_classes()
         self.event_types = self._extract_event_types()
-        # Keep prior show/hide for types that persist; default new ones to shown.
-        self.visible_actions = {a: prev_actions.get(a, True) for a in self.action_types}
-        self.visible_objects = {o: prev_objects.get(o, True) for o in self.object_classes}
-        self.visible_events = {e: prev_events.get(e, True) for e in self.event_types}
+        # Keep prior show/hide for types that persist; a type that was not
+        # there when the filters were read takes its saved choice, and only a
+        # type never seen before defaults to shown.
+        saved = getattr(self, "_saved_rows", {})
+        self.visible_actions = {a: prev_actions.get(a, saved.get("actions", {}).get(a, True))
+                                for a in self.action_types}
+        self.visible_objects = {o: prev_objects.get(o, saved.get("objects", {}).get(o, True))
+                                for o in self.object_classes}
+        self.visible_events = {e: prev_events.get(e, saved.get("events", {}).get(e, True))
+                               for e in self.event_types}
         # Palettes are indexed by position in these lists, so they have to be
         # rebuilt alongside them or colours shift onto the wrong rows.
         self.object_colors = self._color_palette(len(self.object_classes), start_hue=340)
@@ -562,6 +583,9 @@ class SignalTimelineScene(QGraphicsScene):
         return [float(p) if not isinstance(p, dict) else float(p.get('time', 0))
                 for p in self.cache_data.get('motion_peaks', [])]
 
+    def _nav_timestamps_motion_stops(self):
+        return [float(p) for p in self.cache_data.get('motion_stops', [])]
+
     def _nav_timestamps_audio_peaks(self):
         return [float(p) if not isinstance(p, dict) else float(p.get('time', 0))
                 for p in self.cache_data.get('audio_peaks', [])]
@@ -618,6 +642,7 @@ class SignalTimelineScene(QGraphicsScene):
             'scenes': self._nav_timestamps_scenes,
             'motion_events': self._nav_timestamps_motion_events,
             'motion_peaks': self._nav_timestamps_motion_peaks,
+            'motion_stops': self._nav_timestamps_motion_stops,
             'audio_peaks': self._nav_timestamps_audio_peaks,
             'highlights': self._nav_timestamps_highlights,
             'transcript': self._nav_timestamps_transcript,
@@ -982,6 +1007,10 @@ class SignalTimelineScene(QGraphicsScene):
         # Layer 6: Motion Peaks
         if self.visible_layers.get('motion_peaks', True):
             current_y = self.draw_motion_peaks_layer(current_y)
+
+        # Layer 6b: Sudden stops (movement that ends in stillness)
+        if self.visible_layers.get('motion_stops', True) and self.cache_data.get('motion_stops'):
+            current_y = self.draw_motion_stops_layer(current_y)
         
         # Layer 7: Audio Peaks
         if self.visible_layers.get('audio_peaks', True):
@@ -1592,6 +1621,27 @@ class SignalTimelineScene(QGraphicsScene):
 
         return y_pos + self.layer_height + self.layer_spacing
    
+    def draw_motion_stops_layer(self, y_pos):
+        """Sudden stops: movement that ends in stillness - what the peaks row
+        showed before 2026-11-20 (modules/segments/motion_curve.py)."""
+        self.row_labels.append(("SUDDEN STOPS", y_pos))
+        merged = self._merge_intervals(
+            [(float(t), float(t) + 0.5, {'label': 'Stop'})
+             for t in self.cache_data.get('motion_stops', [])])
+        for start, end, meta in merged:
+            count = meta.get('merged_count', 1)
+            bar = TimelineBar(
+                start, end, y_pos, self.layer_height,
+                QColor(self.colors['motion_stops']),
+                f"Stop x{count}" if count > 1 else "Stop",
+                confidence=9,
+                metadata={'timestamp': start, 'merged_count': count,
+                          'meaning': "movement that ends in stillness"},
+            )
+            self.draw_bar(bar)
+            self.bars.append(bar)
+        return y_pos + self.layer_height + self.layer_spacing
+
     def draw_motion_peaks_layer(self, y_pos):
         """Draw motion peaks, with optional merging"""
         self.row_labels.append(("MOTION PEAKS", y_pos))
@@ -1698,12 +1748,14 @@ class SignalTimelineScene(QGraphicsScene):
             return
         pts = downsample(values[:int(round(span_s / step)) or 1],
                          points=max(2, int(width_px)))
-        top = max(pts) or 1.0
+        # Full height is the highest ordinary value, not a single freak bin
+        # (motion_curve.display_top); anything above it is drawn clipped.
+        top = motion_curve.display_top(values) or 1.0
         usable = height * 0.9
         bottom = y_pos + height
         dx = width_px / len(pts)
 
-        points = [QPointF((i + 0.5) * dx, bottom - (v / top) * usable)
+        points = [QPointF((i + 0.5) * dx, bottom - min(v / top, 1.0) * usable)
                   for i, v in enumerate(pts)]
 
         area = QPainterPath(QPointF(0, bottom))
@@ -1728,7 +1780,7 @@ class SignalTimelineScene(QGraphicsScene):
 
         avg = motion_curve.mean_level(curve)
         if avg > 0:
-            y_avg = bottom - (avg / top) * usable
+            y_avg = bottom - min(avg / top, 1.0) * usable
             pen = QPen(QColor(255, 255, 255, 60), 1, Qt.PenStyle.DashLine)
             line = self.addLine(0, y_avg, width_px, y_avg, pen)
             line.setZValue(-4)
@@ -1740,10 +1792,10 @@ class SignalTimelineScene(QGraphicsScene):
         dot. Drawn over the bar and taking no clicks, like the outline."""
         at = motion_curve.peak_time(curve, start, end)
         level = motion_curve.level_at(curve, at)
-        top = max(curve['values']) or 1.0
+        top = motion_curve.display_top(curve['values']) or 1.0
         x = at * self.pixels_per_second
         bottom = y_pos + height
-        y = bottom - (level / top) * height * 0.9
+        y = bottom - min(level / top, 1.0) * height * 0.9
 
         accent = QColor(255, 214, 90)
         items = [
@@ -2022,6 +2074,26 @@ class SignalTimelineScene(QGraphicsScene):
         if bar.metadata:
             for key, value in bar.metadata.items():
                 tooltip_lines.append(f"{key}: {value}")
+            # A composed event is only as clear as its name: say what its rule
+            # checked (modules/rules/rule_explain.py).
+            if bar.metadata.get('composed'):
+                try:
+                    from modules.rules.rule_explain import explain_event
+                    why = explain_event(bar.metadata.get('type'))
+                except Exception:  # noqa: BLE001 - a tooltip never breaks drawing
+                    why = []
+                if why:
+                    tooltip_lines += [""] + why
+                # ...and what those conditions read over this bar's seconds.
+                try:
+                    from modules.rules import rule_evidence
+                    run = rule_evidence.for_bar(
+                        (self.cache_data or {}).get('composed_evidence'),
+                        bar.metadata.get('type'), bar.start_time, bar.end_time)
+                    if run:
+                        tooltip_lines += [""] + rule_evidence.describe(run)
+                except Exception:  # noqa: BLE001
+                    pass
         
         tooltip = "\n".join(tooltip_lines)
         
@@ -2406,7 +2478,17 @@ class SignalTimelineScene(QGraphicsScene):
             "visible_actions": self.visible_actions,
             "visible_objects": self.visible_objects,
             "visible_events": self.visible_events,
+            "visible_expressions": self.visible_expressions,
+            # Only the layers someone ticked or unticked: an empty layer starts
+            # hidden, and saving that would keep it hidden once it has data.
+            "visible_layers": self.chosen_layers,
         }
+        # Rows not in view now keep the choice the file had for them.
+        for key, current in (("visible_actions", self.visible_actions),
+                             ("visible_objects", self.visible_objects),
+                             ("visible_events", self.visible_events)):
+            data[key] = {**getattr(self, "_saved_rows", {}).get(key.split("_", 1)[1], {}),
+                         **current}
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -2437,6 +2519,17 @@ class SignalTimelineScene(QGraphicsScene):
             for k in self.visible_events:
                 if k in saved_events:
                     self.visible_events[k] = bool(saved_events[k])
+            # Kept whole: the scan is loaded separately and may name its
+            # classes only after this runs.
+            self.visible_expressions.update(
+                {str(k): bool(v) for k, v in (data.get("visible_expressions") or {}).items()})
+            # The rows a later reload may bring (events after the rules run,
+            # classes after a detection pass) take these instead of "shown".
+            self._saved_rows = {
+                kind: {str(k): bool(v) for k, v in (data.get(f"visible_{kind}") or {}).items()}
+                for kind in ("actions", "objects", "events")}
+            self.chosen_layers.update(
+                {str(k): bool(v) for k, v in (data.get("visible_layers") or {}).items()})
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -2744,14 +2837,47 @@ class SignalTimelineScene(QGraphicsScene):
     def _nav_timestamps_expressions(self):
         """Bar starts, neutral left out: ◀ ▶ step through the moments a face
         shows something, and neutral is most of any scan."""
-        runs = self._expression_runs()
+        runs = self._shown_expression_runs()
         named = [label for label in runs if label != 'neutral'] or list(runs)
         return sorted(start for label in named for start, _e, _m in runs[label])
+
+    def _shown_expression_runs(self):
+        """``_expression_runs`` without the classes hidden in the Layers panel."""
+        return {label: merged for label, merged in self._expression_runs().items()
+                if self.visible_expressions.get(label, True)}
+
+    def expression_seconds(self) -> dict:
+        """``{label: seconds}`` the scan read each class, in display order."""
+        counts: dict = {}
+        for label in self._expression_runs():
+            counts[label] = 0
+        for value in self.expressions.values():
+            label = str((value or {}).get('label') or '')
+            if label in counts:
+                counts[label] += 1
+        return counts
+
+    def expression_moments(self) -> dict:
+        """``{label: bars}`` - the moments ◀ ▶ step through for each class, so
+        the number beside a class in the Layers panel is the arrows' count."""
+        return {label: len(merged) for label, merged in self._expression_runs().items()}
+
+    def set_expression_filter(self, label, visible):
+        """Show or hide one expression class's row."""
+        self.visible_expressions[label] = bool(visible)
+        self.save_filters()
+        self.build_timeline()
+
+    def set_all_expressions_visible(self, visible):
+        for label in self._expression_runs():
+            self.visible_expressions[label] = bool(visible)
+        self.save_filters()
+        self.build_timeline()
 
     def draw_expressions_layer(self, y_pos):
         """One row per expression class the scan found."""
         self.row_labels.append(("EXPRESSIONS", y_pos))
-        runs = self._expression_runs()
+        runs = self._shown_expression_runs()
         if not runs:
             return y_pos + self.layer_height + self.layer_spacing
 

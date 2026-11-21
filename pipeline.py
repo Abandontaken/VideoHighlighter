@@ -162,7 +162,7 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
                          search_keywords=None, keyword_matches=None, action_bboxes=None,
                          object_bboxes=None, action_detections_all=None,
                          composed_event_names=None, loudness_bursts=None,
-                         loudness_levels=None, motion_curve=None):
+                         loudness_levels=None, motion_curve=None, motion_stops=None):
     """
     Collect all analysis results into a structured dictionary for caching.
 
@@ -231,6 +231,9 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
         # How much motion, every half second — what lets the timeline show which
         # peak was the big one. See modules/segments/motion_curve.py.
         "motion_curve": motion_curve,
+        # Movement that ends in stillness ("Sudden stop"), kept apart from
+        # the peaks since 2026-11-20 (modules/segments/motion_curve.py).
+        "motion_stops": [float(t) for t in (motion_stops or [])],
         "pipeline_version": "1.0",
         "cache_flags": {
             "keyword_segments_only": keyword_segments_only,
@@ -678,6 +681,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         motion_events = []
         motion_peaks = []
         motion_curve = None  # For timeline viewer; absent from older caches
+        motion_stops = []    # Sudden stops; peaks are the curve's tops
         audio_peaks = []
         waveform_data = None  # For timeline viewer
         using_cache = False
@@ -739,6 +743,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                             motion_events = cached_data.get("motion_events", [])
                             motion_peaks = cached_data.get("motion_peaks", [])
                             motion_curve = cached_data.get("motion_curve")
+                            motion_stops = cached_data.get("motion_stops", [])
                             keyword_matches = cached_data.get("keyword_matches", [])
 
 
@@ -905,6 +910,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 "motion_event_points", config.get("motion_event_points", 0)),
             "motion_peak_points": gui_config.get(
                 "motion_peak_points", config.get("motion_peak_points", 3)),
+            # Sudden stops come from the same motion pass.
+            "motion_stop_points": gui_config.get(
+                "motion_stop_points", config.get("motion_stop_points", 0)),
             "audio_peak_points": gui_config.get(
                 "audio_peak_points", config.get("audio_peak_points", 0)),
         }
@@ -961,10 +969,16 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         details=motion_details,
                     )
                     motion_curve = motion_details.get("motion_curve")
+                    motion_stops = motion_details.get("motion_stops", [])
                     
                     # Unpack the results
                     if result and len(result) == 3:
                         scenes, motion_events, motion_peaks = result
+                        # The viewer's Shots run left frame-accurate cuts in
+                        # the cache: score with those, not this pass's.
+                        if using_cache and cached_data.get("scenes_source") == "shot_boundaries":
+                            scenes = [(s.get("start", 0), s.get("end", 0))
+                                      for s in cached_data.get("scenes") or []]
                         log(f"✅ Motion detection results: {len(scenes)} shots, {len(motion_events)} motion events, {len(motion_peaks)} motion peaks")
                     else:
                         log(f"⚠️ Unexpected motion detection result format: {result}")
@@ -1154,11 +1168,15 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 and not (cancel_flag and cancel_flag.is_set())):
             try:
                 if motion_backfill:
-                    cached_data["scenes"] = [{"start": float(s), "end": float(e)}
-                                             for s, e in scenes]
+                    # Frame-accurate shots (the viewer's Shots run) are better
+                    # cuts than the motion pass's by-product; keep them.
+                    if cached_data.get("scenes_source") != "shot_boundaries":
+                        cached_data["scenes"] = [{"start": float(s), "end": float(e)}
+                                                 for s, e in scenes]
                     cached_data["motion_events"] = [float(t) for t in motion_events]
                     cached_data["motion_peaks"] = [float(t) for t in motion_peaks]
                     cached_data["motion_curve"] = motion_curve
+                    cached_data["motion_stops"] = [float(t) for t in motion_stops]
                 if audio_backfill:
                     audio_block = cached_data.get("audio")
                     if isinstance(audio_block, dict):
@@ -1637,6 +1655,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     loudness_bursts=loudness_bursts,
                     loudness_levels=loudness_levels,
                     motion_curve=motion_curve,
+                    motion_stops=motion_stops,
                 )
                 
                 # Add analysis parameters for future validation
@@ -1695,6 +1714,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         scene_score = np.zeros_like(score)
         motion_event_score = np.zeros_like(score)
         motion_peak_score = np.zeros_like(score)
+        motion_stop_score = np.zeros_like(score)
         audio_score = np.zeros_like(score)
         loudness_burst_score = np.zeros_like(score)
         keyword_score = np.zeros_like(score)
@@ -1708,6 +1728,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         SCENE_POINTS = gui_config.get("scene_points", config.get("scene_points", 0))
         MOTION_EVENT_POINTS = gui_config.get("motion_event_points", config.get("motion_event_points", 0))
         MOTION_PEAK_POINTS = gui_config.get("motion_peak_points", config.get("motion_peak_points", 3))
+        # Movement that ends in stillness ("Sudden stop"), from the motion pass.
+        MOTION_STOP_POINTS = gui_config.get("motion_stop_points", config.get("motion_stop_points", 0))
         AUDIO_PEAK_POINTS = gui_config.get("audio_peak_points", config.get("audio_peak_points", 0))
         KEYWORD_POINTS = gui_config.get("keyword_points", config.get("keyword_points", 2))
         BEGINNING_POINTS = gui_config.get("beginning_points", config.get("beginning_points", 0))
@@ -1764,7 +1786,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 "Either add objects to detect, or uncheck 'Score actions only if objects detected'.")
 
         # Check if total possible score is zero (highlight will be empty in MAX mode)
-        total_possible = (SCENE_POINTS + MOTION_PEAK_POINTS + MOTION_EVENT_POINTS +
+        total_possible = (SCENE_POINTS + MOTION_PEAK_POINTS + MOTION_STOP_POINTS + MOTION_EVENT_POINTS +
                         AUDIO_PEAK_POINTS + LOUDNESS_BURST_POINTS +
                         KEYWORD_POINTS + BEGINNING_POINTS +
                         ENDING_POINTS + OBJECT_POINTS + ACTION_POINTS)
@@ -1787,6 +1809,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             idx = int(round(t))
             if 0 <= idx < len(score):
                 motion_peak_score[idx] += MOTION_PEAK_POINTS
+
+        for t in (motion_stops or []):
+            idx = int(round(t))
+            if 0 <= idx < len(score):
+                motion_stop_score[idx] += MOTION_STOP_POINTS
 
         for t in audio_peaks:
             idx = int(round(t))
@@ -1919,7 +1946,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 print(f"⚠️ Cached expression scan not loaded: {_fe}")
 
         # Sum signals
-        score = (scene_score + motion_event_score + motion_peak_score + audio_score +
+        score = (scene_score + motion_event_score + motion_peak_score + motion_stop_score + audio_score +
                  loudness_burst_score +
                  keyword_score + beginning_score + ending_score + object_score +
                  action_score + face_score)
@@ -1927,6 +1954,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # Multi-signal boost
         motion_set = set(int(t) for t in motion_events)
         motion_peaks_set = set(int(t) for t in motion_peaks)
+        motion_stops_set = set(int(round(t)) for t in (motion_stops or []) if MOTION_STOP_POINTS)
         audio_set = set(int(t) for t in audio_peaks)
         object_set = set(object_detections.keys())
         action_set = set(detections_by_sec.keys())
@@ -1935,6 +1963,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             signals = sum([
                 i in motion_set,
                 i in motion_peaks_set,
+                i in motion_stops_set,
                 i in audio_set,
                 i in loudness_burst_set,
                 i in keyword_set,
@@ -2174,6 +2203,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         "scene": scene_score,
                         "motion_event": motion_event_score,
                         "motion_peak": motion_peak_score,
+                        "motion_stop": motion_stop_score,
                         "audio": audio_score,
                         "loudness_burst": loudness_burst_score,
                         "keyword": keyword_score,
@@ -2193,6 +2223,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         "scene_points": SCENE_POINTS,
                         "motion_event_points": MOTION_EVENT_POINTS,
                         "motion_peak_points": MOTION_PEAK_POINTS,
+                        "motion_stop_points": MOTION_STOP_POINTS,
                         "audio_peak_points": AUDIO_PEAK_POINTS,
                         "loudness_burst_points": LOUDNESS_BURST_POINTS,
                         "keyword_points": KEYWORD_POINTS,
@@ -2319,6 +2350,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     'scene_points': SCENE_POINTS,
                     'motion_event_points': MOTION_EVENT_POINTS,
                     'motion_peak_points': MOTION_PEAK_POINTS,
+                    'motion_stop_points': MOTION_STOP_POINTS,
                     'audio_peak_points': AUDIO_PEAK_POINTS,
                     'keyword_points': KEYWORD_POINTS,
                     'object_points': OBJECT_POINTS,
@@ -2505,13 +2537,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             
             # Calculate pre-boost total
             pre_boost_total = (scene_score[idx] + motion_event_score[idx] + 
-                            motion_peak_score[idx] + audio_score[idx] + 
+                            motion_peak_score[idx] + motion_stop_score[idx] + audio_score[idx] + 
                             keyword_score[idx] + object_score[idx] + action_score[idx])
             
             print(f"\nTime {timestamp} ({idx} sec): {score[idx]:.1f} total points")
             print(f"  Shot change: {scene_score[idx]:.1f}")
             print(f"  Motion events: {motion_event_score[idx]:.1f}")
             print(f"  Motion peaks: {motion_peak_score[idx]:.1f}")
+            print(f"  Sudden stops: {motion_stop_score[idx]:.1f}")
             print(f"  Audio: {audio_score[idx]:.1f}")
             print(f"  Keywords: {keyword_score[idx]:.1f}")
             print(f"  Objects: {object_score[idx]:.1f}")
@@ -2562,6 +2595,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             signals = sum([
                 motion_event_score[idx] > 0,
                 motion_peak_score[idx] > 0,
+                motion_stop_score[idx] > 0,
                 audio_score[idx] > 0,
                 loudness_burst_score[idx] > 0,
                 keyword_score[idx] > 0,
@@ -2865,6 +2899,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         loudness_bursts=loudness_bursts,
                         loudness_levels=loudness_levels,
                         motion_curve=motion_curve,
+                        motion_stops=motion_stops,
                     )
 
                 # Hand the edit timeline EXACTLY what we cut (post-subtract,
