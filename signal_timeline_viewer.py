@@ -2639,6 +2639,8 @@ class SignalTimelineWindow(QMainWindow):
         self.object_classes = self.signal_scene.object_classes
         if hasattr(self, 'label_panel'):
             self.label_panel.refresh_labels()
+        if hasattr(self, 'report_panel'):
+            self.report_panel.refresh()       # a run may have written a report
         if hasattr(self, '_update_status'):
             self._update_status()
         print("🔄 Timeline refreshed from disk")
@@ -2901,6 +2903,14 @@ class SignalTimelineWindow(QMainWindow):
         except Exception as e:
             print(f"⚠️ Could not create transcript dock: {e}")
 
+        try:
+            report_dock = self.create_report_dock()
+            self._report_dock = report_dock
+            self.addDockWidget(Qt.RightDockWidgetArea, report_dock)
+            self.tabifyDockWidget(controls_dock, report_dock)
+        except Exception as e:
+            print(f"⚠️ Could not create report dock: {e}")
+
         # Controls is the working tab; the others wait behind it.
         controls_dock.raise_()
 
@@ -3102,6 +3112,11 @@ class SignalTimelineWindow(QMainWindow):
     def eventFilter(self, obj, event):
         """Global event filter for delete, spacebar, and cut-mode exit"""
         if event.type() == event.Type.KeyPress:
+            # The filter is app-wide, and several viewers can be alive (tabs of
+            # one window, or closed and kept for reuse): only the one on screen
+            # answers, or Space would play every video at once.
+            if not self.isVisible():
+                return False
 
             if event.key() == Qt.Key_Escape:
                 if hasattr(self, 'cut_mode_btn') and self.cut_mode_btn.isChecked():
@@ -3897,6 +3912,74 @@ class SignalTimelineWindow(QMainWindow):
         )
         dock.setWidget(panel)
         return dock
+
+    def create_report_dock(self):
+        """Reports about this video, with their times clickable
+        (`video_ai_editor/report_panel.py`): a time moves the playhead, and a
+        time in another video opens that video at it."""
+        from PySide6.QtWidgets import QDockWidget
+
+        from video_ai_editor.report_panel import ReportHost, ReportPanel
+
+        dock = QDockWidget("Report", self)
+        dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        dock.setMinimumWidth(260)
+        self.report_panel = ReportPanel(self.video_path, parent=self)
+        self.report_panel.seek_requested.connect(self._seek_from_report)
+        # The host puts the panel in the dock, or in a window of its own
+        # ("Pop out"), and remembers which.
+        self._report_host = ReportHost(
+            self, dock, self.report_panel,
+            title=f"Report — {os.path.basename(self.video_path or '')}")
+        return dock
+
+    def show_report(self, path):
+        """Show ``path`` in the Report tab (or its window) and bring it forward."""
+        panel = getattr(self, 'report_panel', None)
+        if panel is None:
+            return False
+        panel.load(path)
+        host = getattr(self, '_report_host', None)
+        if host is not None:
+            host.reveal()
+        return True
+
+    def _seek_from_report(self, seconds, video):
+        """A time clicked in this viewer's report.
+
+        This video's time, with this viewer on screen: move the playhead.
+        Otherwise the main window brings the right viewer forward (another
+        video, or this one from a hidden tab) and it jumps there. A popped-out
+        report is the app's one report window and is left exactly as it was,
+        and put back on top for the next click; a report in the tab is shown
+        in the new viewer's tab instead, since this one goes out of sight."""
+        if not video:
+            if self.isVisible():
+                self._jump_to_time(seconds)
+                return
+            video = self.video_path              # a hidden tab: bring it back
+        owner = getattr(self, '_owner', None)
+        if owner is None or not hasattr(owner, 'open_timeline_viewer'):
+            print(f"⚠️ Report link to another video, but no main window: {video}")
+            return
+        if not os.path.isfile(video):
+            print(f"⚠️ Report link to a video that is not there: {video}")
+            return
+        report = getattr(self.report_panel, 'path', None)
+        host = getattr(self, '_report_host', None)
+        popped = bool(host is not None and host.popped)
+        owner.open_timeline_viewer(video_path=video)
+        window = getattr(owner, 'timeline_window', None)
+        if window is None:
+            return
+        try:
+            if window is not self and report and not popped:
+                window.show_report(report)
+            window._jump_to_time(seconds)
+        except RuntimeError:                       # the new window went away
+            pass
+        if popped:
+            host.keep_on_top()
 
     def create_transcript_dock(self):
         """Create transcript dock — reads from SRT or transcript txt next to video"""
